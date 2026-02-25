@@ -6,3 +6,4 @@ __pycache__/
 state.json
 data/
 raw_data/
+k8s/secret.yaml
