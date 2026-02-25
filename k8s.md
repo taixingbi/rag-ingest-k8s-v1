@@ -1,57 +1,4 @@
-# RAG Ingest - MongoDB Atlas Vector Search
-
-## Configuration (.env)
-
-```bash
-MONGODB_URI="mongodb+srv://<user>:<pass>@<cluster>/<db>?retryWrites=true&w=majority"
-MONGODB_DB="rag"
-MONGODB_COLLECTION="rag_chunks"
-
-# Embed: openai (TPM-limited) or sentence_transformers (local, no TPM limit)
-EMBED_PROVIDER=openai
-OPENAI_API_KEY="sk-..."
-OPENAI_EMBED_MODEL="text-embedding-3-small"  # or text-embedding-3-large
-
-# For local embeddings (no TPM limit, lower latency): EMBED_PROVIDER=sentence_transformers, EMBED_MODEL=BAAI/bge-small-en-v1.5
-# EMBED_BATCH_SIZE_LOCAL=256   # larger = faster encode (sentence_transformers only)
-# EMBED_DEVICE=cuda            # or mps, cpu (sentence_transformers only; default auto)
-
-CHUNK_TOKENS=1000
-OVERLAP_TOKENS=150
-BATCH_SIZE=128
-EMBED_MAX_CONCURRENT=8
-MAX_CONCURRENT_FILES=6
-# Token bucket (OpenAI only; ignored when EMBED_PROVIDER=sentence_transformers)
-EMBED_TPM_SAFETY=0.9
-# OPENAI_TPM_LIMIT=1000000   # set higher if your account has more TPM
-```
-
 ## Docker (docker-compose)
-
-Requires a `.env` in the project root (see Configuration). Put input files under `./data` on the host; they are mounted at `/data` in the container.
-
-**MongoDB from Docker:** The default command uses `--target atlas`, so `MONGODB_URI` in `.env` must be your **Atlas** connection string (`mongodb+srv://...`). If it is `mongodb://localhost:27017`, the container will try to reach MongoDB inside the container and get "Connection refused". To use MongoDB running on your host Mac from inside the container, use `--target localhost` and set in `.env`: `MONGODB_URI_LOCAL=mongodb://host.docker.internal:27017`.
-
-**One-off ingest (recommended)** — uses default command with `/data`, `--force`, in-process async:
-
-```bash
-docker-compose run --rm rag-ingest
-```
-
-Run this **exact** one-liner (nothing after `rag-ingest`). Pasting a multi-line command without `\` at the end of each line will make zsh run the next line as a new command (`command not found: --target`). Adding flags like `--force` after `rag-ingest` replaces the whole command and can cause "unrecognized arguments".
-
-**Custom command** — if you override, use `--input-dir /data` (path inside the container):
-
-```bash
-# Async (default, in-process)
-docker-compose run --rm rag-ingest python main.py ingest \
-  --input-dir /data --pattern "**/*" \
-  --env dev --target atlas --mode async --force
-
-# Sync
-docker-compose run --rm rag-ingest python main.py ingest \
-  --input-dir /data --env dev --target atlas --force
-```
 
 ## Usage
 Options:
@@ -88,9 +35,6 @@ docker-compose run --rm rag-ingest python main.py ingest \
   --force
 
 ## Kubernetes (step-by-step)
-
-Run one-off ingest as a **Job** on any Kubernetes cluster (Docker Desktop, minikube, or remote). No queue services—single Job, then exit. Defaults are tuned for Mac mini 4 / low-resource; increase `resources` in `job.yaml` and ConfigMap batch/concurrency for stronger nodes.
-
 ---
 
 ### Step 1: Ensure you have a cluster and kubectl

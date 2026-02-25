@@ -1,6 +1,7 @@
 # One-off ingest job. Resources tuned for Mac mini 4 / low-resource; increase for stronger nodes.
 # Local cluster: docker build -t rag-ingest:latest . then apply.
 # Remote cluster: use your registry image and set imagePullPolicy: Always (or remove it).
+# To change resources/image: kubectl delete job rag-ingest && kubectl apply -f k8s/job.yaml (Job spec.template is immutable).
 # kubectl apply -f k8s/configmap.yaml -f k8s/pvc.yaml -f k8s/job.yaml  (create secret first via kubectl)
 apiVersion: batch/v1
 kind: Job
@@ -22,12 +23,13 @@ spec:
           image: rag-ingest:latest
           imagePullPolicy: Never
           resources:
-            requests:
-              memory: "1Gi"
-              cpu: "1"
             limits:
-              memory: "2Gi"
-              cpu: "2"
+              memory: "8Gi"
+              cpu: "8"
+            requests:
+              memory: "6Gi"
+              cpu: "6"
+
           command:
             - python
             - -u

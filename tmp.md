@@ -38,3 +38,5 @@ docker-compose run --rm rag-ingest python main.py ingest \
   --input-dir /data \
   --pattern "*.json" \
   --force
+
+
