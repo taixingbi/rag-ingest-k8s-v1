@@ -1,0 +1,61 @@
+# One-off ingest job. Resources tuned for Mac mini 4 / low-resource; increase for stronger nodes.
+# Local cluster: docker build -t rag-ingest:latest . then apply.
+# Remote cluster: use your registry image and set imagePullPolicy: Always (or remove it).
+# kubectl apply -f k8s/configmap.yaml -f k8s/pvc.yaml -f k8s/job.yaml  (create secret first via kubectl)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rag-ingest
+  labels:
+    app: rag-ingest
+spec:
+  ttlSecondsAfterFinished: 86400  # keep finished job 24h for logs
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: rag-ingest
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: ingest
+          image: rag-ingest:latest
+          imagePullPolicy: Never
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "1"
+            limits:
+              memory: "2Gi"
+              cpu: "2"
+          command:
+            - python
+            - -u
+            - main.py
+            - ingest
+            - --input-dir
+            - /data
+            - --pattern
+            - "**/*"
+            - --env
+            - dev
+            - --target
+            - atlas
+            - --mode
+            - async
+            - --force
+          env:
+            - name: STATE_FILE
+              value: /data/state.json
+          envFrom:
+            - configMapRef:
+                name: rag-ingest-config
+            - secretRef:
+                name: rag-ingest-secret
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: rag-ingest-data

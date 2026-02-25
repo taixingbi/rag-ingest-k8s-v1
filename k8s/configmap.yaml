@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-ingest-config
+  labels:
+    app: rag-ingest
+data:
+  MONGODB_DB: "db_hunt"
+  MONGODB_COLLECTION: "collection_taixingbi"
+  CHUNK_TOKENS: "1000"
+  OVERLAP_TOKENS: "150"
+  CHUNK_CHARS: "5000"
+  OVERLAP_CHARS: "800"
+  BATCH_SIZE: "32"
+  MAX_CONCURRENT_FILES: "1"
+  EMBED_BATCH_SIZE_LOCAL: "64"
+  EMBED_PROVIDER: "sentence_transformers"
+  # EMBED_MODEL: "BAAI/bge-small-en-v1.5"  # optional; default used if unset

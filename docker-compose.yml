@@ -1,0 +1,14 @@
+# RAG ingest. Run: docker-compose run --rm rag-ingest
+# Override command: docker-compose run --rm rag-ingest python main.py ingest --input-dir /data --env dev --target atlas
+services:
+  rag-ingest:
+    build: .
+    # env from .env (MONGODB_URI, OPENAI_API_KEY, etc.)
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - ./state.json:/app/state.json
+      # Mount app code so streaming progress / latest code is used without rebuilding
+      - .:/app
+    command: ["python", "main.py", "ingest", "--input-dir", "/data", "--pattern", "**/*", "--env", "dev", "--target", "atlas", "--mode", "async", "--force"]
