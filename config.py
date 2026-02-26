@@ -19,6 +19,19 @@ def _env_int(key: str, default: str) -> int:
     return int(os.environ.get(key, default))
 
 
+def _embed_model_default() -> str:
+    """Default embed model from EMBED_MODEL or provider; reads EMBED_PROVIDER once."""
+    model = _env("EMBED_MODEL", "")
+    if model:
+        return model
+    provider = _env("EMBED_PROVIDER", "ollama")
+    if provider == "ollama":
+        return "nomic-embed-text"
+    if provider == "vllm":
+        return ""
+    return "text-embedding-3-small"
+
+
 @dataclass
 class Settings:
     mongodb_uri: str = field(default_factory=lambda: _env("MONGODB_URI", ""))
@@ -26,12 +39,13 @@ class Settings:
     mongodb_collection: str = field(default_factory=lambda: _env("MONGODB_COLLECTION", "rag_chunks"))
 
     openai_api_key: str = field(default_factory=lambda: _env("OPENAI_API_KEY", ""))
-    # Embed: "openai" or "sentence_transformers"
-    embed_provider: str = field(default_factory=lambda: _env("EMBED_PROVIDER", "openai"))
-    embed_model: str = field(
-        default_factory=lambda: _env("EMBED_MODEL", "")
-        or ("BAAI/bge-small-en-v1.5" if _env("EMBED_PROVIDER", "openai") == "sentence_transformers" else "text-embedding-3-small")
-    )
+    # Embed: "openai", "ollama", or "vllm"
+    embed_provider: str = field(default_factory=lambda: _env("EMBED_PROVIDER", "ollama"))
+    embed_model: str = field(default_factory=_embed_model_default)
+    # For ollama/vllm: base URL (defaults applied in main: 11434 for ollama, 8000 for vllm)
+    embed_base_url: str = field(default_factory=lambda: _env("EMBED_BASE_URL", ""))
+    # Optional hint for Vector Search index dims (ollama/vllm); 0 = use 1536 in hint
+    embed_dims: int = field(default_factory=lambda: _env_int("EMBED_DIMS", "0"))
 
     # Chunking (token-based preferred, char-based fallback)
     chunk_tokens: int = field(default_factory=lambda: _env_int("CHUNK_TOKENS", "1000"))
@@ -41,11 +55,6 @@ class Settings:
 
     # Ingest (batch size for embeddings API; max throughput defaults)
     batch_size: int = field(default_factory=lambda: _env_int("BATCH_SIZE", "128"))
-    # Local (sentence_transformers) only: larger batches = lower latency (no API limit). Default 256.
-    embed_batch_size_local: int = field(default_factory=lambda: _env_int("EMBED_BATCH_SIZE_LOCAL", "256"))
     max_concurrent_files: int = field(default_factory=lambda: _env_int("MAX_CONCURRENT_FILES", "6"))
     block_queue_size: int = field(default_factory=lambda: _env_int("BLOCK_QUEUE_SIZE", "4"))
     embed_max_concurrent: int = field(default_factory=lambda: _env_int("EMBED_MAX_CONCURRENT", "8"))
-
-    # Device for sentence_transformers: "cuda", "mps", "cpu" (default auto)
-    embed_device: str = field(default_factory=lambda: _env("EMBED_DEVICE", ""))

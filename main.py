@@ -15,10 +15,10 @@ Env (.env):
   MONGODB_DB="rag"
   MONGODB_COLLECTION="rag_chunks"
   OPENAI_API_KEY="..."
-  OPENAI_EMBED_MODEL="text-embedding-3-small"
+  EMBED_MODEL="text-embedding-3-small"  # or set per provider (default: nomic-embed-text for ollama)
   CHUNK_TOKENS=1000
   OVERLAP_TOKENS=150
-  BATCH_SIZE=64
+  BATCH_SIZE=128
 """
 
 from __future__ import annotations
@@ -33,9 +33,6 @@ import threading
 import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
-# Suppress Hugging Face / sentence_transformers progress bars and load reports when loading model later.
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 # In K8s/Docker there is no TTY; force line buffering so logs appear in kubectl logs / docker logs.
 if not sys.stdout.isatty():
@@ -61,8 +58,6 @@ from embed import (
     acquire_tokens,
     embed_texts_openai,
     embed_texts_openai_async,
-    embed_texts_sentence_transformers,
-    embed_texts_sentence_transformers_async,
     estimate_tokens,
 )
 from normalize import _extract_metadata, detect_file_type, normalize_document
@@ -83,14 +78,28 @@ except ImportError:
     AsyncIOMotorClient = None
 
 
-def _suppress_sentence_transformers_verbose() -> None:
-    """Disable transformers progress bars and LOAD REPORT so Docker/logs stay clean."""
-    try:
-        import transformers.utils.logging as _tflog
-        _tflog.disable_progress_bar()
-        _tflog.set_verbosity_error()
-    except Exception:
-        pass
+def _is_openai_compatible(settings: Settings) -> bool:
+    """True when embed provider uses OpenAI-compatible API (openai, ollama, vllm)."""
+    return settings.embed_provider in ("openai", "ollama", "vllm")
+
+
+def _require_openai_compatible(settings: Settings) -> None:
+    """Raise ValueError if embed provider is not openai, ollama, or vllm."""
+    if not _is_openai_compatible(settings):
+        raise ValueError(
+            f"Unsupported EMBED_PROVIDER={settings.embed_provider!r}; use openai, ollama, or vllm."
+        )
+
+
+def _openai_embed_client_kwargs(settings: Settings) -> dict:
+    """Kwargs for OpenAI(...) or AsyncOpenAI(...). Use only when _is_openai_compatible(settings)."""
+    if settings.embed_provider == "openai":
+        return {"api_key": settings.openai_api_key}
+    if settings.embed_provider == "ollama":
+        return {"base_url": settings.embed_base_url or "http://localhost:11434/v1", "api_key": "ollama"}
+    if settings.embed_provider == "vllm":
+        return {"base_url": settings.embed_base_url or "http://localhost:8000/v1", "api_key": "vllm"}
+    raise ValueError(f"Not an OpenAI-compatible provider: {settings.embed_provider}")
 
 
 # ----------------------------
@@ -151,9 +160,9 @@ def build_docs_for_file(
     if not chunks:
         return []
     
-    # Embed in batches (OpenAI: async with limited concurrency to avoid 429)
+    # Embed in batches (OpenAI-compatible: async with limited concurrency to avoid 429)
     embeddings: List[List[float]] = []
-    if settings.embed_provider == "openai":
+    if _is_openai_compatible(settings):
         sem = asyncio.Semaphore(settings.embed_max_concurrent)
 
         async def _embed_one(client: Any, model: str, batch: List[str]) -> List[List[float]]:
@@ -163,7 +172,7 @@ def build_docs_for_file(
                 return await embed_texts_openai_async(client, model, batch)
 
         async def _embed_batches() -> List[List[float]]:
-            client = AsyncOpenAI(api_key=settings.openai_api_key)
+            client = AsyncOpenAI(**_openai_embed_client_kwargs(settings))
             try:
                 batches = [chunks[i : i + settings.batch_size] for i in range(0, len(chunks), settings.batch_size)]
                 tasks = [_embed_one(client, settings.embed_model, b) for b in batches]
@@ -173,9 +182,7 @@ def build_docs_for_file(
                 await client.close()
         embeddings = asyncio.run(_embed_batches())
     else:
-        embeddings = embed_texts_sentence_transformers(
-            embed_client, chunks, batch_size=settings.embed_batch_size_local
-        )
+        _require_openai_compatible(settings)
     
     # Build MongoDB documents matching target schema
     docs = _docs_from_chunks_embeddings(
@@ -222,7 +229,7 @@ async def build_docs_for_file_async(
         next_milestone = PROGRESS_CHUNK_INTERVAL
         for start in range(0, n_total, PROGRESS_CHUNK_INTERVAL):
             batch_chunks = chunks[start : start + PROGRESS_CHUNK_INTERVAL]
-            if settings.embed_provider == "openai":
+            if _is_openai_compatible(settings):
                 sem = asyncio.Semaphore(settings.embed_max_concurrent)
 
                 async def _embed_one(batch: List[str]) -> List[List[float]]:
@@ -237,9 +244,7 @@ async def build_docs_for_file_async(
                 results = await asyncio.gather(*[_embed_one(b) for b in api_batches])
                 batch_embs = [e for r in results for e in r]
             else:
-                batch_embs = await embed_texts_sentence_transformers_async(
-                    embed_client, batch_chunks, batch_size=settings.embed_batch_size_local
-                )
+                _require_openai_compatible(settings)
             embeddings.extend(batch_embs)
             timings["embed"] = time.perf_counter() - t_embed_start
             n_done = start + len(batch_chunks)
@@ -247,7 +252,7 @@ async def build_docs_for_file_async(
                 progress_callback(next_milestone, n_total, timings)
                 next_milestone += PROGRESS_CHUNK_INTERVAL
     else:
-        if settings.embed_provider == "openai":
+        if _is_openai_compatible(settings):
             sem = asyncio.Semaphore(settings.embed_max_concurrent)
 
             async def _embed_one(batch: List[str]) -> List[List[float]]:
@@ -262,9 +267,7 @@ async def build_docs_for_file_async(
             results = await asyncio.gather(*[_embed_one(b) for b in batches])
             embeddings = [e for r in results for e in r]
         else:
-            embeddings = await embed_texts_sentence_transformers_async(
-                embed_client, chunks, batch_size=settings.embed_batch_size_local
-            )
+            _require_openai_compatible(settings)
         timings["embed"] = time.perf_counter() - t_embed_start
     docs = _docs_from_chunks_embeddings(
         source_id, filepath, file_type, mtime, filename, file_metadata,
@@ -288,7 +291,7 @@ def _docs_from_chunks_embeddings(
     """Build MongoDB doc dicts from chunks and embeddings. Single source of truth for doc schema."""
     if not embeddings:
         return []
-    dims = len(embeddings[0]) if embeddings else (384 if settings.embed_provider == "sentence_transformers" else 1536)
+    dims = len(embeddings[0]) if embeddings else 1536
     title = _title_for_doc(file_metadata, filename)
     tags = _tags_from_filename(filename)
     ts = now_iso()
@@ -312,25 +315,6 @@ def _docs_from_chunks_embeddings(
         }
         docs.append(doc)
     return docs
-
-
-def _build_docs_for_block(
-    source_id: str,
-    filepath: str,
-    file_type: str,
-    mtime: str,
-    filename: str,
-    file_metadata: Optional[Dict[str, Any]],
-    chunks: List[str],
-    embeddings: List[List[float]],
-    chunk_offset: int,
-    settings: Settings,
-) -> List[Dict[str, Any]]:
-    """Build MongoDB doc dicts for one block of chunks."""
-    return _docs_from_chunks_embeddings(
-        source_id, filepath, file_type, mtime, filename, file_metadata,
-        chunks, embeddings, chunk_offset, settings,
-    )
 
 
 def process_ndjson_blocks(
@@ -377,7 +361,7 @@ def process_ndjson_blocks(
             await acquire_tokens(cost)
             async with sem:
                 return await embed_texts_openai_async(client, model, batch)
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        client = AsyncOpenAI(**_openai_embed_client_kwargs(settings))
         try:
             batches = [chunks_block[i : i + settings.batch_size] for i in range(0, len(chunks_block), settings.batch_size)]
             n_batches = len(batches)
@@ -423,15 +407,13 @@ def process_ndjson_blocks(
             return
         # print(f"  Block {block_num}: {len(chunks)} chunks, embedding...", flush=True)
         t0 = time.perf_counter()
-        if settings.embed_provider == "openai":
+        if _is_openai_compatible(settings):
             embeddings = asyncio.run(_embed_block_batches(chunks, block_num=block_num))
         else:
-            embeddings = embed_texts_sentence_transformers(
-                embed_client, chunks, batch_size=settings.embed_batch_size_local
-            )
+            _require_openai_compatible(settings)
         timings["embed"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        docs = _build_docs_for_block(
+        docs = _docs_from_chunks_embeddings(
             source_id, filepath, file_type, mtime, filename, file_metadata,
             chunks, embeddings, chunk_offset, settings,
         )
@@ -480,7 +462,10 @@ def process_ndjson_blocks(
                 block_num += 1
                 objs: List[Any] = []
                 for line in block:
-                    objs.append(json.loads(line))
+                    try:
+                        objs.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass  # skip malformed line
                 block_queue.put((block_num, objs))
         block_queue.put((None, None))
 
@@ -508,6 +493,7 @@ def ingest_folder(
     skip_unchanged: bool = True,
     job_index: Optional[int] = None,
     job_total: Optional[int] = None,
+    mode: str = "sync",
 ) -> None:
     """
     Ingest all matching files from folder.
@@ -517,12 +503,16 @@ def ingest_folder(
         skip_unchanged: If True, skip files that haven't changed since last ingest
         job_index: When set with job_total, only process files where index % job_total == job_index (Indexed Job).
         job_total: Total number of parallel pods (with job_index).
+        mode: Ingest mode for logging ("sync" or "async").
     """
     settings = Settings()
-    
+    _log_ingest_config(settings, folder_glob, mode)
+
     assert settings.mongodb_uri, "Missing MONGODB_URI"
     if settings.embed_provider == "openai":
         assert settings.openai_api_key, "Missing OPENAI_API_KEY"
+    if settings.embed_provider == "vllm":
+        assert settings.embed_model, "Missing EMBED_MODEL for vllm"
     
     # MongoDB connection
     mongo = MongoClient(settings.mongodb_uri)
@@ -530,18 +520,11 @@ def ingest_folder(
     col = db[settings.mongodb_collection]
     ensure_unique_index(col)
     
-    # Embed client (OpenAI or SentenceTransformer)
-    if settings.embed_provider == "openai":
-        embed_client = OpenAI(api_key=settings.openai_api_key)
-        print(f"Embed: openai ({settings.embed_model})")
+    # Embed client (OpenAI, ollama, or vllm)
+    if _is_openai_compatible(settings):
+        embed_client = OpenAI(**_openai_embed_client_kwargs(settings))
     else:
-        _suppress_sentence_transformers_verbose()
-        from sentence_transformers import SentenceTransformer
-        print(f"Embed: sentence_transformers ({settings.embed_model})")
-        embed_client = SentenceTransformer(
-            settings.embed_model,
-            device=settings.embed_device or None,
-        )
+        _require_openai_compatible(settings)
     
     # Load state for incremental ingestion
     state = load_state()
@@ -625,12 +608,6 @@ def ingest_folder(
     print(f"  Total chunks upserted: {total_docs}")
     print(f"  Files skipped (unchanged): {skipped}")
     print(f"  MongoDB: {settings.mongodb_db}.{settings.mongodb_collection}")
-    print(f"\nNext steps:")
-    dim_hint = 384 if settings.embed_provider == "sentence_transformers" else 1536
-    print(f"  1. Create Vector Search index in Atlas UI:")
-    print(f"     - Field: embedding (knnVector, dims={dim_hint})")
-    print(f"     - Optional filters: source.source_id, metadata.tags")
-    print(f"  2. Optional: Add text index for hybrid search (field: text)")
 
 
 PROGRESS_CHUNK_INTERVAL = 640  # Print progress every N chunks (async path: upsert in batches and print after each)
@@ -746,12 +723,16 @@ def ingest_folder_async(
     skip_unchanged: bool = True,
     job_index: Optional[int] = None,
     job_total: Optional[int] = None,
+    mode: str = "async",
 ) -> None:
     """Ingest using async workers in-process (no queue). Saves state at end. When job_index/job_total set, only process this pod's share of files."""
     settings = Settings()
+    _log_ingest_config(settings, folder_glob, mode)
     assert settings.mongodb_uri, "Missing MONGODB_URI"
     if settings.embed_provider == "openai":
         assert settings.openai_api_key, "Missing OPENAI_API_KEY"
+    if settings.embed_provider == "vllm":
+        assert settings.embed_model, "Missing EMBED_MODEL for vllm"
     assert AsyncIOMotorClient is not None, "Install motor: pip install motor"
 
     async def _run() -> None:
@@ -761,15 +742,10 @@ def ingest_folder_async(
         db = mongo[settings.mongodb_db]
         col = db[settings.mongodb_collection]
         await async_ensure_unique_index(col)
-        if settings.embed_provider == "openai":
-            embed_client = AsyncOpenAI(api_key=settings.openai_api_key)
+        if _is_openai_compatible(settings):
+            embed_client = AsyncOpenAI(**_openai_embed_client_kwargs(settings))
         else:
-            _suppress_sentence_transformers_verbose()
-            from sentence_transformers import SentenceTransformer
-            embed_client = SentenceTransformer(
-                settings.embed_model,
-                device=settings.embed_device or None,
-            )
+            _require_openai_compatible(settings)
         state = load_state()
         all_files = get_files_for_ingest(folder_glob)
         if job_index is not None and job_total is not None:
@@ -805,8 +781,7 @@ def ingest_folder_async(
             _write_run_start(input_dir, ts_start)
             print(f"{ts_start} RUN_START mode={pod_name} embedder={settings.embed_provider} model={settings.embed_model} shards={total_pipeline_shards} input_dir={input_dir}", flush=True)
 
-        # sentence_transformers models are not thread-safe; only one file at a time to avoid segfault/crash.
-        max_concurrent = 1 if settings.embed_provider == "sentence_transformers" else settings.max_concurrent_files
+        max_concurrent = settings.max_concurrent_files
         sem = asyncio.Semaphore(max_concurrent)
         progress_lock = asyncio.Lock()
         total_docs = 0
@@ -905,7 +880,7 @@ def add_ingest_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=["sync", "async"], default="async")
     parser.add_argument("--max-inflight", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--embedder", default="sentence-transformers")
+    parser.add_argument("--embedder", default="ollama")
     parser.add_argument("--input-dir", default="./data", help="Directory to glob for files (default: ./data)")
     parser.add_argument("--pattern", default="**/*", help="Glob pattern under input-dir, e.g. *.json (default: **/*)")
     parser.add_argument("--force", action="store_true")
@@ -922,6 +897,36 @@ def _ingest_glob(args: argparse.Namespace) -> str:
     else:
         combined = f"{base}{os.sep}**{os.sep}{pat}"
     return combined.replace("\\", "/")
+
+
+def _ingest_input_dir_and_pattern(folder_glob: str) -> Tuple[str, str]:
+    """Derive input_dir and pattern from folder_glob for config logging."""
+    if "**" in folder_glob:
+        before, rest = folder_glob.split("**", 1)
+        input_dir = before.rstrip("/").rstrip(os.sep) or "."
+        pattern = "**" + rest
+    else:
+        input_dir = os.path.dirname(folder_glob) or "."
+        pattern = os.path.basename(folder_glob)
+    return input_dir, pattern
+
+
+def _log_ingest_config(settings: Settings, folder_glob: str, mode: str) -> None:
+    """Print startup config (target, batch_size, mode, embedder, input_dir, pattern) and k8s env when set."""
+    target = "atlas" if (settings.mongodb_uri and "mongodb+srv" in settings.mongodb_uri) else "localhost"
+    input_dir, pattern = _ingest_input_dir_and_pattern(folder_glob)
+    print(
+        f"Config: target={target} batch_size={settings.batch_size} mode={mode} embedder={settings.embed_provider} "
+        f"embed_model={settings.embed_model} input_dir={input_dir} pattern={pattern}",
+        flush=True,
+    )
+    k8s_parts = []
+    for key in ("JOB_PARALLELISM", "JOB_COMPLETION_INDEX", "JOB_COMPLETIONS", "STATE_FILE"):
+        val = os.environ.get(key, "").strip()
+        if val:
+            k8s_parts.append(f"{key}={val}")
+    if k8s_parts:
+        print("K8s: " + " ".join(k8s_parts), flush=True)
 
 
 if __name__ == "__main__":
@@ -950,11 +955,15 @@ if __name__ == "__main__":
     if args.target == "localhost":
         os.environ["MONGODB_URI"] = os.environ.get("MONGODB_URI_LOCAL", "mongodb://localhost:27017")
 
-    # Embedder -> EMBED_PROVIDER (openai | sentence_transformers)
-    if args.embedder == "sentence-transformers":
-        os.environ["EMBED_PROVIDER"] = "sentence_transformers"
-    elif args.embedder == "openai":
+    # Embedder -> EMBED_PROVIDER (openai | ollama | vllm)
+    if args.embedder == "openai":
         os.environ["EMBED_PROVIDER"] = "openai"
+    elif args.embedder == "ollama":
+        os.environ["EMBED_PROVIDER"] = "ollama"
+    elif args.embedder == "vllm":
+        os.environ["EMBED_PROVIDER"] = "vllm"
+    else:
+        raise ValueError(f"Unsupported --embedder={args.embedder!r}; use openai, ollama, or vllm.")
     os.environ["BATCH_SIZE"] = str(args.batch_size)
 
     skip_unchanged = not args.force
@@ -974,6 +983,6 @@ if __name__ == "__main__":
             pass
 
     if use_async:
-        ingest_folder_async(folder_glob, skip_unchanged=skip_unchanged, job_index=job_index_val, job_total=job_total_val)
+        ingest_folder_async(folder_glob, skip_unchanged=skip_unchanged, job_index=job_index_val, job_total=job_total_val, mode=args.mode)
     else:
-        ingest_folder(folder_glob, skip_unchanged=skip_unchanged, job_index=job_index_val, job_total=job_total_val)
+        ingest_folder(folder_glob, skip_unchanged=skip_unchanged, job_index=job_index_val, job_total=job_total_val, mode=args.mode)

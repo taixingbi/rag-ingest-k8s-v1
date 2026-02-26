@@ -22,7 +22,7 @@ def load_state() -> Dict[str, Dict[str, str]]:
         if not raw:
             return {}
         return json.loads(raw)
-    except Exception as e:
+    except (OSError, json.JSONDecodeError) as e:
         import sys
         print(f"Warning: could not load state from {state_file}: {e}", file=sys.stderr, flush=True)
         return {}

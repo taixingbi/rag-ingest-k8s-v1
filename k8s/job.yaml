@@ -1,4 +1,4 @@
-# One-off ingest job. Resources tuned for Mac mini 4 / low-resource; increase for stronger nodes.
+# One-off ingest job. Mac mini: parallelism 1 + --mode sync keeps Ollama warm and feeds it one batch at a time (CPU inference scales with batch size, not concurrency).
 # Local cluster: docker build -t rag-ingest:latest . then apply.
 # Remote cluster: use your registry image and set imagePullPolicy: Always (or remove it).
 # To change resources/image: kubectl delete job rag-ingest && kubectl apply -f k8s/job.yaml (Job spec.template is immutable).
@@ -13,8 +13,8 @@ spec:
   ttlSecondsAfterFinished: 86400  # keep finished job 24h for logs
   backoffLimit: 0
   completionMode: Indexed
-  completions: 4
-  parallelism: 4
+  completions: 1
+  parallelism: 1
   template:
     metadata:
       labels:
@@ -47,13 +47,15 @@ spec:
             - --target
             - atlas
             - --mode
-            - async
+            - sync
             - --force
           env:
             - name: STATE_FILE
               value: /data/state.json
             - name: JOB_PARALLELISM
-              value: "4"
+              value: "1"
+            - name: JOB_COMPLETIONS
+              value: "1"
           envFrom:
             - configMapRef:
                 name: rag-ingest-config
