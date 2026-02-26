@@ -12,6 +12,9 @@ metadata:
 spec:
   ttlSecondsAfterFinished: 86400  # keep finished job 24h for logs
   backoffLimit: 0
+  completionMode: Indexed
+  completions: 4
+  parallelism: 4
   template:
     metadata:
       labels:
@@ -24,11 +27,11 @@ spec:
           imagePullPolicy: Never
           resources:
             limits:
-              memory: "8Gi"
-              cpu: "8"
-            requests:
               memory: "6Gi"
-              cpu: "6"
+              cpu: "3"
+            requests:
+              memory: "4Gi"
+              cpu: "2"
 
           command:
             - python
@@ -49,6 +52,8 @@ spec:
           env:
             - name: STATE_FILE
               value: /data/state.json
+            - name: JOB_PARALLELISM
+              value: "4"
           envFrom:
             - configMapRef:
                 name: rag-ingest-config

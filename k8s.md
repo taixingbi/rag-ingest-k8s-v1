@@ -101,6 +101,8 @@ persistentvolumeclaim/rag-ingest-data created
 job.batch/rag-ingest created
 ```
 
+**Indexed Job (2 pods):** The Job uses `completionMode: Indexed` with `completions: 2` and `parallelism: 2`, so two pods run at once. Each pod gets a unique `JOB_COMPLETION_INDEX` (0 or 1) from Kubernetes and processes a disjoint subset of files: pod 0 handles files at index 0, 2, 4, ... and pod 1 handles 1, 3, 5, ... (partition by `file_index % job_total == job_index`). Each pod uses its own state file (`/data/state-0.json`, `/data/state-1.json`) to avoid conflicts on the shared PVC. To change the number of pods, update `completions`, `parallelism`, and the `JOB_PARALLELISM` env var in `k8s/job.yaml` so they all match, then delete and re-apply the Job.
+
 ---
 
 ### Step 5: (Optional) Put input files in the volume
@@ -117,6 +119,8 @@ kubectl cp ./data data-loader:/data/
 kubectl delete pod data-loader
 ```
 
+If `kubectl wait` times out or you see "cannot exec into a container in a completed pod; current phase is Failed", the pod failed before becoming Ready. Check why: `kubectl describe pod data-loader` and `kubectl logs data-loader`. Common causes: PVC `rag-ingest-data` not bound (create it first with `kubectl apply -f k8s/pvc.yaml`), or the cluster cannot pull the `busybox` image. Fix the issue, then delete the pod and re-run the apply/wait/cp/delete steps.
+
 **Option B —** Use an init container or a different volume (e.g. hostPath) in `k8s/job.yaml` if your data already lives somewhere the cluster can mount.
 
 ---
@@ -128,19 +132,19 @@ kubectl delete pod data-loader
 kubectl get job rag-ingest
 kubectl get pods -l app=rag-ingest
 
-# Stream logs (replace POD_NAME if needed)
-kubectl logs -f job/rag-ingest
+kubectl logs -l job-name=rag-ingest --all-containers=true
 ```
 
 ---
 
 ### Step 7: Re-run or clean up
 
-- **Run the Job again** (e.g. after adding more files to the PVC):
+- **Run the Job again** (e.g. after adding more files to the PVC, or after changing `job.yaml`):
   ```bash
   kubectl delete job rag-ingest
   kubectl apply -f k8s/job.yaml
   ```
+  Job `spec.template` and `spec.completionMode` are immutable; if `kubectl apply` reports "field is immutable", delete the job first, then apply.
 - **Remove everything:**
   ```bash
   kubectl delete job rag-ingest
@@ -151,12 +155,7 @@ kubectl logs -f job/rag-ingest
 
 ---
 
-### Files in `k8s/`
-
-| File | Purpose |
-|------|--------|
-| `configmap.yaml` | Non-sensitive env (MONGODB_DB, MONGODB_COLLECTION, chunk/batch, EMBED_PROVIDER). Edit to match your env. |
-| `secret.yaml` | Optional; only if you want to manage secrets from a file. Prefer `kubectl create secret` (Step 2). |
-| `pvc.yaml` | PersistentVolumeClaim for `/data` and state; 5Gi. |
-| `job.yaml` | One-off ingest Job; uses ConfigMap + Secret + PVC. |
-| `data-loader-pod.yaml` | Optional; temporary pod to copy host `./data` into the PVC (see Step 5). |
+### command 
+ ```bash
+kubectl get job rag-ingest -o yaml
+  ```

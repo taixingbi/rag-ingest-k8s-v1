@@ -31,6 +31,7 @@ import queue
 import sys
 import threading
 import time
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Suppress Hugging Face / sentence_transformers progress bars and load reports when loading model later.
@@ -505,6 +506,8 @@ def process_ndjson_blocks(
 def ingest_folder(
     folder_glob: str = "data/**/*",
     skip_unchanged: bool = True,
+    job_index: Optional[int] = None,
+    job_total: Optional[int] = None,
 ) -> None:
     """
     Ingest all matching files from folder.
@@ -512,6 +515,8 @@ def ingest_folder(
     Args:
         folder_glob: Glob pattern for files to ingest (e.g., "data/**/*.json")
         skip_unchanged: If True, skip files that haven't changed since last ingest
+        job_index: When set with job_total, only process files where index % job_total == job_index (Indexed Job).
+        job_total: Total number of parallel pods (with job_index).
     """
     settings = Settings()
     
@@ -542,6 +547,8 @@ def ingest_folder(
     state = load_state()
     start = time.perf_counter()
     files = get_files_for_ingest(folder_glob)
+    if job_index is not None and job_total is not None:
+        files = [f for i, f in enumerate(files) if i % job_total == job_index]
     print(f"Found {len(files)} files matching pattern")
     
     total_docs = 0
@@ -665,11 +672,82 @@ async def _process_one_file_async(
     return len(docs), None, timings
 
 
+def _run_meta_dir(folder_glob: str) -> str:
+    """Base directory for pipeline run meta (shared across pods)."""
+    return folder_glob.split("**")[0].rstrip("/") if "**" in folder_glob else folder_glob
+
+
+def _write_run_start(meta_dir: str, ts: str) -> None:
+    try:
+        path = os.path.join(meta_dir, ".run_start.json")
+        with open(path, "w") as f:
+            json.dump({"ts": ts}, f)
+    except Exception:
+        pass
+
+
+def _read_run_start(meta_dir: str) -> Optional[str]:
+    try:
+        path = os.path.join(meta_dir, ".run_start.json")
+        if os.path.isfile(path):
+            with open(path) as f:
+                return json.load(f).get("ts")
+    except Exception:
+        pass
+    return None
+
+
+def _write_run_done(meta_dir: str, job_index: int, chunks: int, errors: int, ts: str) -> None:
+    try:
+        path = os.path.join(meta_dir, f".run_done_{job_index}.json")
+        with open(path, "w") as f:
+            json.dump({"chunks": chunks, "errors": errors, "ts": ts}, f)
+    except Exception:
+        pass
+
+
+def _list_run_done_count(meta_dir: str) -> int:
+    try:
+        import glob
+        pattern = os.path.join(meta_dir, ".run_done_*.json")
+        return len(glob.glob(pattern))
+    except Exception:
+        return 0
+
+
+def _read_all_run_done(meta_dir: str) -> List[Dict[str, Any]]:
+    try:
+        import glob
+        pattern = os.path.join(meta_dir, ".run_done_*.json")
+        out = []
+        for path in glob.glob(pattern):
+            with open(path) as f:
+                out.append(json.load(f))
+        return out
+    except Exception:
+        return []
+
+
+def _remove_run_meta(meta_dir: str) -> None:
+    try:
+        import glob
+        for pattern in (os.path.join(meta_dir, ".run_start.json"), os.path.join(meta_dir, ".run_done_*.json")):
+            for path in glob.glob(pattern):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def ingest_folder_async(
     folder_glob: str = "data/**/*",
     skip_unchanged: bool = True,
+    job_index: Optional[int] = None,
+    job_total: Optional[int] = None,
 ) -> None:
-    """Ingest using async workers in-process (no queue). Saves state at end."""
+    """Ingest using async workers in-process (no queue). Saves state at end. When job_index/job_total set, only process this pod's share of files."""
     settings = Settings()
     assert settings.mongodb_uri, "Missing MONGODB_URI"
     if settings.embed_provider == "openai":
@@ -678,23 +756,27 @@ def ingest_folder_async(
 
     async def _run() -> None:
         start = time.perf_counter()
+        pod_name = os.environ.get("HOSTNAME", "local")
         mongo = AsyncIOMotorClient(settings.mongodb_uri)
         db = mongo[settings.mongodb_db]
         col = db[settings.mongodb_collection]
         await async_ensure_unique_index(col)
         if settings.embed_provider == "openai":
             embed_client = AsyncOpenAI(api_key=settings.openai_api_key)
-            print(f"Embed: openai ({settings.embed_model})")
         else:
             _suppress_sentence_transformers_verbose()
             from sentence_transformers import SentenceTransformer
-            print(f"Embed: sentence_transformers ({settings.embed_model})")
             embed_client = SentenceTransformer(
                 settings.embed_model,
                 device=settings.embed_device or None,
             )
         state = load_state()
-        files = get_files_for_ingest(folder_glob)
+        all_files = get_files_for_ingest(folder_glob)
+        if job_index is not None and job_total is not None:
+            files = [f for i, f in enumerate(all_files) if i % job_total == job_index]
+        else:
+            files = all_files
+        total_pipeline_shards = len(all_files)
         to_process: List[str] = []
         skipped = 0
         for filepath in files:
@@ -710,12 +792,18 @@ def ingest_folder_async(
                 except Exception as e:
                     print(f"Warning: Could not check state for {filepath}: {e}")
             to_process.append(filepath)
-        print(f"Found {len(files)} files; {len(to_process)} to process, {skipped} skipped (unchanged)", flush=True)
         if not to_process:
             if skip_unchanged:
                 save_state(state)
             print(f"Nothing to do. Durable time: {time.perf_counter() - start:.2f}s")
             return
+
+        input_dir = _run_meta_dir(folder_glob)
+        ts_start = datetime.now().astimezone().replace(microsecond=0).isoformat()
+        # RUN_START once per pipeline: only pod 0 (or single process) prints and writes start meta
+        if job_total is None or job_total == 1 or job_index == 0:
+            _write_run_start(input_dir, ts_start)
+            print(f"{ts_start} RUN_START mode={pod_name} embedder={settings.embed_provider} model={settings.embed_model} shards={total_pipeline_shards} input_dir={input_dir}", flush=True)
 
         # sentence_transformers models are not thread-safe; only one file at a time to avoid segfault/crash.
         max_concurrent = 1 if settings.embed_provider == "sentence_transformers" else settings.max_concurrent_files
@@ -728,6 +816,7 @@ def ingest_folder_async(
         total_timings: Dict[str, float] = {"load_parse": 0.0, "chunk": 0.0, "embed": 0.0, "mongo_bulk_write": 0.0, "finalize": 0.0}
 
         total_files = len(to_process)
+
         async def process_with_semaphore(filepath: str, block_num: int) -> None:
             nonlocal total_docs, processed, errors, last_printed_round
             async with sem:
@@ -755,31 +844,57 @@ def ingest_folder_async(
                         filename = os.path.basename(filepath)
                         thr = n / total_s if total_s > 0 else 0
                         lat_ms = (total_s / n * 1000) if n else 0
-                        embed_pct = (100 * em / total_s) if total_s > 0 else 0
-                        write_pct = (100 * mb / total_s) if total_s > 0 else 0
-                        prefix = f"file {block_num}/{total_files}: "
-                        print(f"{prefix}INGEST shard={filename} chunks={n} total={total_s:.3f}s thr={thr:.1f}c/s lat={lat_ms:.1f}ms | embed={em:.3f}s({embed_pct:.1f}%) write={mb:.3f}s({write_pct:.1f}%) chunk={ch:.3f}s db_del={db_del:.3f}s parse={lp:.3f}s", flush=True)
+                        embed_pct = int(100 * em / total_s) if total_s > 0 else 0
+                        mongo_ns = f"{settings.mongodb_db}.{settings.mongodb_collection}"
+                        ts = datetime.now().astimezone().replace(microsecond=0).isoformat()
+                        print(f"{ts} {pod_name} INGEST shard={filename} chunks={n} total_s={total_s:.2f} thr={thr:.1f}cps lat_ms={lat_ms:.1f} embed_s={em:.2f}({embed_pct}%) write_s={mb:.2f} chunk_s={ch:.2f} db_del_s={db_del:.2f} parse_s={lp:.2f} durable_s={total_s:.2f} errors=0 mongo={mongo_ns}", flush=True)
                     else:
-                        print(f"  ✓ {filepath} -> {n} chunks ({total_s:.2f}s)", flush=True)
+                        filename = os.path.basename(filepath)
+                        mongo_ns = f"{settings.mongodb_db}.{settings.mongodb_collection}"
+                        ts = datetime.now().astimezone().replace(microsecond=0).isoformat()
+                        print(f"{ts} {pod_name} INGEST shard={filename} chunks={n} durable_s={total_s:.2f} errors=0 mongo={mongo_ns}", flush=True)
                 except Exception as e:
                     errors += 1
                     print(f"  ✗ {filepath}: {e}", flush=True)
                     import traceback
                     traceback.print_exc()
+                    mongo_ns = f"{settings.mongodb_db}.{settings.mongodb_collection}"
+                    ts = datetime.now().astimezone().replace(microsecond=0).isoformat()
+                    print(f"{ts} {pod_name} INGEST shard={os.path.basename(filepath)} durable_s=0 chunks=0 errors=1 mongo={mongo_ns}", flush=True)
 
         await asyncio.gather(*[process_with_semaphore(fp, i + 1) for i, fp in enumerate(to_process)])
 
-        lp, ch, em, mb = total_timings["load_parse"], total_timings["chunk"], total_timings["embed"], total_timings["mongo_bulk_write"]
-        print(f"  total summary: load_parse={lp:.3f}s chunk={ch:.3f}s embed={em:.3f}s mongo_bulk_write={mb:.3f}s chunks={total_docs}", flush=True)
+        wall_s = time.perf_counter() - start
+        mongo_ns = f"{settings.mongodb_db}.{settings.mongodb_collection}"
+        ts_end = datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+        # RUN_SUMMARY once per pipeline: last pod to finish aggregates and prints
+        if job_total is None or job_total == 1:
+            avg_thr = total_docs / wall_s if wall_s > 0 else 0
+            print(flush=True)
+            print(f"{ts_end} RUN_SUMMARY mode={pod_name} shards={processed} total_chunks={total_docs} wall_s={wall_s:.2f} avg_thr={avg_thr:.1f}cps errors={errors} mongo={mongo_ns}", flush=True)
+        else:
+            idx = job_index if job_index is not None else 0
+            _write_run_done(input_dir, idx, total_docs, errors, ts_end)
+            done_count = _list_run_done_count(input_dir)
+            if done_count >= job_total:
+                start_ts = _read_run_start(input_dir)
+                dones = _read_all_run_done(input_dir)
+                agg_chunks = sum(d.get("chunks", 0) for d in dones)
+                agg_errors = sum(d.get("errors", 0) for d in dones)
+                try:
+                    t0 = datetime.fromisoformat(start_ts) if start_ts else None
+                    t1 = max(datetime.fromisoformat(d.get("ts", "")) for d in dones) if dones else None
+                    wall_s = (t1 - t0).total_seconds() if t0 and t1 else wall_s
+                except Exception:
+                    pass
+                avg_thr = agg_chunks / wall_s if wall_s > 0 else 0
+                print(flush=True)
+                print(f"{ts_end} RUN_SUMMARY mode={pod_name} shards={total_pipeline_shards} total_chunks={agg_chunks} wall_s={wall_s:.2f} avg_thr={avg_thr:.1f}cps errors={agg_errors} mongo={mongo_ns}", flush=True)
+                _remove_run_meta(input_dir)
 
         if skip_unchanged:
             save_state(state)
-        durable_s = time.perf_counter() - start
-        print(f"\nDone (async).", flush=True)
-        print(f"  Durable time: {durable_s:.2f}s", flush=True)
-        print(f"  Total chunks upserted: {total_docs}", flush=True)
-        print(f"  Files processed: {processed}, errors: {errors}", flush=True)
-        print(f"  MongoDB: {settings.mongodb_db}.{settings.mongodb_collection}", flush=True)
 
     asyncio.run(_run())
 
@@ -845,7 +960,20 @@ if __name__ == "__main__":
     skip_unchanged = not args.force
     use_async = args.mode == "async"
 
+    # Indexed Job: per-pod state and partition files by job index
+    job_index_val: Optional[int] = None
+    job_total_val: Optional[int] = None
+    job_completion_index = os.environ.get("JOB_COMPLETION_INDEX", "").strip()
+    job_parallelism = os.environ.get("JOB_PARALLELISM", "").strip()
+    if job_completion_index != "" and job_parallelism != "":
+        try:
+            job_index_val = int(job_completion_index)
+            job_total_val = int(job_parallelism)
+            os.environ["STATE_FILE"] = f"/data/state-{job_completion_index}.json"
+        except ValueError:
+            pass
+
     if use_async:
-        ingest_folder_async(folder_glob, skip_unchanged=skip_unchanged)
+        ingest_folder_async(folder_glob, skip_unchanged=skip_unchanged, job_index=job_index_val, job_total=job_total_val)
     else:
-        ingest_folder(folder_glob, skip_unchanged=skip_unchanged)
+        ingest_folder(folder_glob, skip_unchanged=skip_unchanged, job_index=job_index_val, job_total=job_total_val)
