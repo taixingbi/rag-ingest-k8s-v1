@@ -1,0 +1,23 @@
+# Temporary pod to load data into the PVC. Use once, then delete.
+# Usage:
+#   kubectl apply -f k8s/data-loader-pod.yaml
+#   kubectl wait --for=condition=Ready pod/data-loader --timeout=60s
+#   kubectl cp ./data data-loader:/data/
+#   kubectl delete pod data-loader
+apiVersion: v1
+kind: Pod
+metadata:
+  name: data-loader
+spec:
+  restartPolicy: Never
+  containers:
+    - name: data-loader
+      image: busybox
+      command: ["sleep", "3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: rag-ingest-data
