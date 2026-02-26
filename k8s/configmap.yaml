@@ -11,8 +11,7 @@ data:
   OVERLAP_TOKENS: "150"
   CHUNK_CHARS: "5000"
   OVERLAP_CHARS: "800"
-  BATCH_SIZE: "32"
-  MAX_CONCURRENT_FILES: "1"
-  EMBED_BATCH_SIZE_LOCAL: "64"
-  EMBED_PROVIDER: "sentence_transformers"
-  # EMBED_MODEL: "BAAI/bge-small-en-v1.5"  # optional; default used if unset
+  BATCH_SIZE: "128"
+  MAX_CONCURRENT_FILES: "6"
+  EMBED_PROVIDER: "ollama"
+  # EMBED_MODEL: "nomic-embed-text"  # optional; default for ollama

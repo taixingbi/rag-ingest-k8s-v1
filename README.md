@@ -4,7 +4,7 @@ Local ingestion pipeline that reads files (JSON/MD/PDF), chunks them, computes e
 
 ## Architecture
 
-- **Mac mini (local)**: Reads files → chunks → computes embeddings (OpenAI or sentence_transformers) → upserts to Atlas
+- **Mac mini (local)**: Reads files → chunks → computes embeddings (OpenAI, ollama, or vLLM) → upserts to Atlas
 - **MongoDB Atlas**: Stores text + metadata + embedding vector with Vector Search index
 
 
@@ -27,21 +27,23 @@ MONGODB_URI="mongodb+srv://<user>:<pass>@<cluster>/<db>?retryWrites=true&w=major
 MONGODB_DB="rag"
 MONGODB_COLLECTION="rag_chunks"
 
-# Embed: openai (TPM-limited) or sentence_transformers (local, no TPM limit)
-EMBED_PROVIDER=openai
+# Embed: openai | ollama | vllm (default: ollama)
+EMBED_PROVIDER=ollama
 OPENAI_API_KEY="sk-..."
-OPENAI_EMBED_MODEL="text-embedding-3-small"  # or text-embedding-3-large
+OPENAI_EMBED_MODEL="text-embedding-3-small"  # or text-embedding-3-large (openai only)
 
-# For local embeddings (no TPM limit, lower latency): EMBED_PROVIDER=sentence_transformers, EMBED_MODEL=BAAI/bge-small-en-v1.5
-# EMBED_BATCH_SIZE_LOCAL=256   # larger = faster encode (sentence_transformers only)
-# EMBED_DEVICE=cuda            # or mps, cpu (sentence_transformers only; default auto)
+# Self-hosted (no TPM limit):
+#   ollama: EMBED_PROVIDER=ollama, EMBED_MODEL=nomic-embed-text (default), EMBED_BASE_URL=http://localhost:11434/v1. Install: ollama serve then ollama pull nomic-embed-text (use pull, not run)
+#   vllm: EMBED_PROVIDER=vllm, EMBED_MODEL=<your-model>, EMBED_BASE_URL=http://localhost:8000/v1
+# EMBED_BASE_URL=   # override for ollama/vllm (defaults: 11434/v1 for ollama, 8000/v1 for vllm). From Docker with Ollama on host: http://host.docker.internal:11434/v1
+# EMBED_DIMS=      # optional; embedding dimension hint for Atlas Vector Search index (ollama/vllm; used in "Next steps" print)
 
 CHUNK_TOKENS=1000
 OVERLAP_TOKENS=150
 BATCH_SIZE=128
 EMBED_MAX_CONCURRENT=8
 MAX_CONCURRENT_FILES=6
-# Token bucket (OpenAI only; ignored when EMBED_PROVIDER=sentence_transformers)
+# Token bucket (OpenAI only; ignored for ollama, vllm)
 EMBED_TPM_SAFETY=0.9
 # OPENAI_TPM_LIMIT=1000000   # set higher if your account has more TPM
 ```
@@ -51,6 +53,8 @@ EMBED_TPM_SAFETY=0.9
 Requires a `.env` in the project root (see Configuration). Put input files under `./data` on the host; they are mounted at `/data` in the container.
 
 **MongoDB from Docker:** The default command uses `--target atlas`, so `MONGODB_URI` in `.env` must be your **Atlas** connection string (`mongodb+srv://...`). If it is `mongodb://localhost:27017`, the container will try to reach MongoDB inside the container and get "Connection refused". To use MongoDB running on your host Mac from inside the container, use `--target localhost` and set in `.env`: `MONGODB_URI_LOCAL=mongodb://host.docker.internal:27017`.
+
+**Ollama from Docker:** If ingest runs in Docker and Ollama runs on the host Mac, the container cannot use `localhost:11434`. In `.env` set `EMBED_BASE_URL=http://host.docker.internal:11434/v1` so the container reaches Ollama on the host.
 
 **One-off ingest (recommended)** — uses default command with `/data`, `--force`, in-process async:
 
@@ -82,7 +86,7 @@ Options:
 `--mode` (sync|async), default: async (in-process).
 `--max-inflight` (default: 128), max in-flight tasks.
 `--batch-size` (default: 64), embedding batch size.
-`--embedder` (default: sentence-transformers), openai or sentence-transformers.
+`--embedder` (default: ollama): openai, ollama, or vllm.
 `--force`, re-ingest all files (ignore state).
 `--resume`, resume from state (if supported).
 `--dry-run`, don't write to DB (if supported).
@@ -91,18 +95,20 @@ python main.py ingest \
   --env dev \
   --target atlas \
   --mode async \
-  --batch-size 32 \
-  --embedder sentence-transformers \
+  --batch-size 64 \
+  --embedder ollama \
   --input-dir ./data \
   --pattern "*.json" \
   --force
 
+docker build -t rag-ingest:latest .
+
 docker-compose run --rm rag-ingest python main.py ingest \
   --env dev \
   --target atlas \
-  --mode async \
-  --batch-size 32 \
-  --embedder sentence-transformers \
+  --mode sync \
+  --batch-size 64 \
+  --embedder ollama \
   --input-dir /data \
   --pattern "*.json" \
   --force

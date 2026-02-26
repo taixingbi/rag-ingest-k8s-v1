@@ -9,7 +9,7 @@ Options:
 `--mode` (sync|async), default: async (in-process).
 `--max-inflight` (default: 128), max in-flight tasks.
 `--batch-size` (default: 64), embedding batch size.
-`--embedder` (default: sentence-transformers), openai or sentence-transformers.
+`--embedder` (default: ollama): openai, ollama, or vllm.
 `--force`, re-ingest all files (ignore state).
 `--resume`, resume from state (if supported).
 `--dry-run`, don't write to DB (if supported).
@@ -19,7 +19,7 @@ python main.py ingest \
   --target atlas \
   --mode async \
   --batch-size 32 \
-  --embedder sentence-transformers \
+  --embedder ollama \
   --input-dir ./data \
   --pattern "*.json" \
   --force
@@ -29,7 +29,7 @@ docker-compose run --rm rag-ingest python main.py ingest \
   --target atlas \
   --mode async \
   --batch-size 32 \
-  --embedder sentence-transformers \
+  --embedder ollama \
   --input-dir /data \
   --pattern "*.json" \
   --force
@@ -101,7 +101,7 @@ persistentvolumeclaim/rag-ingest-data created
 job.batch/rag-ingest created
 ```
 
-**Indexed Job (2 pods):** The Job uses `completionMode: Indexed` with `completions: 2` and `parallelism: 2`, so two pods run at once. Each pod gets a unique `JOB_COMPLETION_INDEX` (0 or 1) from Kubernetes and processes a disjoint subset of files: pod 0 handles files at index 0, 2, 4, ... and pod 1 handles 1, 3, 5, ... (partition by `file_index % job_total == job_index`). Each pod uses its own state file (`/data/state-0.json`, `/data/state-1.json`) to avoid conflicts on the shared PVC. To change the number of pods, update `completions`, `parallelism`, and the `JOB_PARALLELISM` env var in `k8s/job.yaml` so they all match, then delete and re-apply the Job.
+**Indexed Job (1 pod by default):** The Job uses `completionMode: Indexed` with `completions: 1` and `parallelism: 1` so a single pod runs—good for a local cluster (e.g. Mac mini) where one pod keeps the embed model warm and avoids CPU thrash. The job runs with `--mode sync` so Ollama (or other local CPU inference) gets one batch at a time and saturates the vector engine; async is better for multi-GPU/cloud where concurrency helps. Kubernetes injects `JOB_COMPLETION_INDEX` (0 for one pod). For multi-node cloud runs you can increase throughput by setting `completions`, `parallelism`, and `JOB_PARALLELISM` to the same value (e.g. 4); each pod then processes a disjoint subset of files and uses `/data/state-{index}.json`. After changing the Job spec, delete the job and re-apply (Job spec is immutable).
 
 ---
 
